@@ -1,0 +1,168 @@
+# xiaozhi-esp32-server - full deployment (server + manager web + MySQL + Redis)
+# Based on upstream main/xiaozhi-server/docker-compose_all.yml
+# Changes: images from ghcr.io, TZ=Asia/Tokyo, host.docker.internal for local VieNeu-TTS (port 8010 on host)
+services:
+  xiaozhi-esp32-server:
+    image: ghcr.io/xinnan-tech/xiaozhi-esp32-server:server_latest
+    container_name: xiaozhi-esp32-server
+    depends_on:
+      - xiaozhi-esp32-server-db
+      - xiaozhi-esp32-server-redis
+    restart: always
+    networks:
+      - default
+    ports:
+      - "8000:8000"   # websocket for devices
+      - "8003:8003"   # http: OTA + vision
+    security_opt:
+      - seccomp:unconfined
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - TZ=Asia/Tokyo
+    volumes:
+      - ./data:/opt/xiaozhi-esp32-server/data
+      - ./models/SenseVoiceSmall/model.pt:/opt/xiaozhi-esp32-server/models/SenseVoiceSmall/model.pt
+      # Patch: keep Gemini 3 thought_signature across tool calls (fixes 400 "missing a thought_signature").
+      # Copied from server_latest 0.9.8 + patch. Re-check after updating the image (originals in ./patch/orig).
+      - ./patch/connection.py:/opt/xiaozhi-esp32-server/core/connection.py:ro
+      - ./patch/openai.py:/opt/xiaozhi-esp32-server/core/providers/llm/openai/openai.py:ro
+      # Patch: bộ nhớ dài hạn tóm tắt bằng tiếng Việt, dùng key riêng của agent, ghi vào ai_agent.summary_memory
+      - ./patch/mem_local_short.py:/opt/xiaozhi-esp32-server/core/providers/memory/mem_local_short/mem_local_short.py:ro
+      # Patch: chặn robot khi tài khoản hết hạn sử dụng (bảng user_subscription, 3 ngày dùng thử)
+      - ./patch/receiveAudioHandle.py:/opt/xiaozhi-esp32-server/core/handle/receiveAudioHandle.py:ro
+
+  xiaozhi-esp32-server-web:
+    image: ghcr.io/xinnan-tech/xiaozhi-esp32-server:web_latest
+    container_name: xiaozhi-esp32-server-web
+    restart: always
+    networks:
+      - default
+    depends_on:
+      xiaozhi-esp32-server-db:
+        condition: service_healthy
+      xiaozhi-esp32-server-redis:
+        condition: service_healthy
+    ports:
+      - "8002:8002"   # manager web
+    environment:
+      - TZ=Asia/Tokyo
+      - SPRING_DATASOURCE_DRUID_URL=jdbc:mysql://xiaozhi-esp32-server-db:3306/xiaozhi_esp32_server?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Tokyo&nullCatalogMeansCurrent=true&connectTimeout=30000&socketTimeout=30000&autoReconnect=true&failOverReadOnly=false&maxReconnects=10
+      - SPRING_DATASOURCE_DRUID_USERNAME=root
+      - SPRING_DATASOURCE_DRUID_PASSWORD=123456
+      - SPRING_DATA_REDIS_HOST=xiaozhi-esp32-server-redis
+      - SPRING_DATA_REDIS_PASSWORD=
+      - SPRING_DATA_REDIS_PORT=6379
+    volumes:
+      - ./uploadfile:/uploadfile
+      # Web UI đã Việt hoá các chuỗi viết cứng (bản gốc: ./web-orig). Kiểm tra lại khi cập nhật image web.
+      - ./web-vi:/usr/share/nginx/html:ro
+
+  xiaozhi-esp32-server-db:
+    image: mysql:latest
+    container_name: xiaozhi-esp32-server-db
+    healthcheck:
+      test: [ "CMD", "mysqladmin" ,"ping", "-h", "localhost" ]
+      timeout: 45s
+      interval: 10s
+      retries: 10
+    restart: always
+    networks:
+      - default
+    expose:
+      - 3306
+    volumes:
+      - ./mysql/data:/var/lib/mysql
+    environment:
+      - TZ=Asia/Tokyo
+      - MYSQL_ROOT_PASSWORD=123456
+      - MYSQL_DATABASE=xiaozhi_esp32_server
+      - MYSQL_INITDB_ARGS="--character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci"
+
+  # Nhận diện người nói (3D-Speaker). Config: ./voiceprint/.voiceprint.yaml, DB voiceprint_db trong MySQL ở trên
+  voiceprint-api:
+    image: ghcr.io/xinnan-tech/voiceprint-api:latest
+    container_name: voiceprint-api
+    restart: always
+    depends_on:
+      xiaozhi-esp32-server-db:
+        condition: service_healthy
+    networks:
+      - default
+    ports:
+      - "8005:8005"
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      - TZ=Asia/Tokyo
+    volumes:
+      - ./voiceprint:/app/data
+      # giữ model CAM++ đã tải (ModelScope) qua các lần khởi động lại
+      - ./voiceprint/modelscope-cache:/root/.cache/modelscope
+      - ./voiceprint/voiceprint_service.py:/app/app/services/voiceprint_service.py:ro
+
+  # Đăng nhập / đăng ký bằng Google cho trang quản lý (Cloudflare route xiaozhi.minizjp.com/auth/* về đây)
+  xiaozhi-google-auth:
+    build: ./google-auth
+    image: xiaozhi-google-auth:local
+    container_name: xiaozhi-google-auth
+    restart: always
+    env_file: ./google-auth/.env
+    depends_on:
+      - xiaozhi-esp32-server-db
+    networks:
+      - default
+
+  # TTS tiếng Nhật (VOICEVOX, CPU) - chỉ dùng nội bộ qua tts-router
+  voicevox:
+    image: voicevox/voicevox_engine:cpu-latest
+    container_name: voicevox
+    restart: always
+    networks:
+      - default
+
+  # TTS router Việt/Nhật: đoạn tiếng Nhật -> VOICEVOX, còn lại -> VieNeu (host:8010). xiaozhi gọi :8020
+  xiaozhi-tts-router:
+    build: ./tts-router
+    image: xiaozhi-tts-router:local
+    container_name: xiaozhi-tts-router
+    restart: always
+    depends_on:
+      - voicevox
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - JA_SPEAKER=3
+    networks:
+      - default
+
+  # Cloudflare Tunnel: public xiaozhi.minizjp.com (web/OTA), xiaozhi-ws.minizjp.com (robot), xiaozhi-vision.minizjp.com
+  xiaozhi-cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: xiaozhi-cloudflared
+    restart: always
+    command: tunnel --no-autoupdate --protocol http2 --config /etc/cloudflared/config.yml run
+    depends_on:
+      - xiaozhi-esp32-server
+      - xiaozhi-esp32-server-web
+    networks:
+      - default
+    volumes:
+      - ./cloudflared:/etc/cloudflared:ro
+
+  xiaozhi-esp32-server-redis:
+    image: redis:8.0
+    expose:
+      - 6379
+    container_name: xiaozhi-esp32-server-redis
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - default
+
+networks:
+  default:

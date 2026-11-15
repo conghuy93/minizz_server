@@ -1,0 +1,10 @@
+mysql:
+  database: voiceprint_db
+  host: xiaozhi-esp32-server-db
+  password: <SECRET>
+  port: 3306
+  user: root
+server:
+  authorization: <VOICEPRINT_KEY>
+  host: 0.0.0.0
+  port: 8005

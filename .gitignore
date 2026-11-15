@@ -1,0 +1,17 @@
+# secret - KHONG BAO GIO commit
+.env
+*.env
+!*.env.example
+cloudflared/credentials.json
+voiceprint/.voiceprint.yaml
+data/
+mysql/
+models/
+uploadfile/
+*.log
+*.wav
+*.mp3
+*.tgz
+node_modules/
+dist/
+__pycache__/
