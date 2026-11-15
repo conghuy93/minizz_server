@@ -14,6 +14,13 @@ function Say($msg, $color = "Gray") { Write-Host $msg -ForegroundColor $color }
 function Test-Http($url) {
     try { Invoke-RestMethod $url -TimeoutSec 3 | Out-Null; return $true } catch { return $false }
 }
+function Test-Text($url, $text) {
+    try { return ((Invoke-WebRequest $url -UseBasicParsing -TimeoutSec 4).Content -like "*$text*") } catch { return $false }
+}
+function Test-DbHealthy { (docker inspect -f "{{.State.Health.Status}}" xiaozhi-esp32-server-db) -eq "healthy" }
+# Kiểm tra THẬT (cổng mở chưa đủ: docker luôn giữ cổng mở dù chương trình bên trong chưa chạy)
+$ApiOk    = { Test-Http "http://127.0.0.1:8002/xiaozhi/user/pub-config" }
+$ServerOk = { Test-Text "http://127.0.0.1:8000/xiaozhi/v1/" "Server is running" }
 function Test-Port($port) {
     $c = New-Object Net.Sockets.TcpClient
     try { $c.ConnectAsync("127.0.0.1", $port).Wait(1500) -and $c.Connected } catch { $false } finally { $c.Close() }
@@ -37,8 +44,9 @@ $Checks = [ordered]@{
     "Docker"                       = { Test-Docker }
     "VieNeu-TTS (8010, GPU)"       = { Test-Http "http://127.0.0.1:8010/health" }
     "ASR PhoWhisper (8012, GPU)"   = { Test-Http "http://127.0.0.1:8012/health" }
-    "xiaozhi server (8000 WS)"     = { Test-Port 8000 }
-    "Web quản trị (8002)"          = { Test-Port 8002 }
+    "Cơ sở dữ liệu MySQL"          = { Test-DbHealthy }
+    "API quản trị + OTA (8002)"    = { (& $ApiOk) -and (Test-Text "http://127.0.0.1:8002/xiaozhi/ota/" "OTA") }
+    "xiaozhi server (8000 WS)"     = { & $ServerOk }
     "Google auth (8090)"           = { (docker inspect -f "{{.State.Running}}" xiaozhi-google-auth) -eq "true" }
     "TTS router + VOICEVOX"        = { (docker exec xiaozhi-tts-router python -c "import httpx;print(httpx.get('http://localhost:8020/health',timeout=5).json()['ok'])") -eq "True" }
     "Nhận diện giọng (voiceprint)" = { (docker inspect -f "{{.State.Running}}" voiceprint-api) -eq "true" }
@@ -89,8 +97,19 @@ function Start-All {
     Say "- Chờ dịch vụ sẵn sàng..."
     Wait-Until "VieNeu-TTS"     { Test-Http "http://127.0.0.1:8010/health" } 240 | Out-Null
     Wait-Until "ASR PhoWhisper" { Test-Http "http://127.0.0.1:8012/health" } 240 | Out-Null
-    Wait-Until "Web quản trị"   { Test-Port 8002 } 120 | Out-Null
-    Wait-Until "xiaozhi server" { Test-Port 8000 } 180 | Out-Null
+    Wait-Until "MySQL"          { Test-DbHealthy } 120 | Out-Null
+    # API Java hay chết nếu bật trước MySQL (Docker Desktop tự bật lại mọi container cùng lúc) -> tự sửa
+    if (-not (Wait-Until "API quản trị" $ApiOk 90)) {
+        Say "  -> API lỗi (thường do bật trước MySQL). Khởi động lại container web..." Yellow
+        docker restart xiaozhi-esp32-server-web 2>&1 | Out-Null
+        Wait-Until "API quản trị (lần 2)" $ApiOk 150 | Out-Null
+    }
+    # server lấy cấu hình từ API; nếu API vừa được sửa thì server có thể còn kẹt -> tự sửa
+    if (-not (Wait-Until "xiaozhi server" $ServerOk 90)) {
+        Say "  -> Server chưa nhận được cấu hình. Khởi động lại server..." Yellow
+        docker restart xiaozhi-esp32-server 2>&1 | Out-Null
+        Wait-Until "xiaozhi server (lần 2)" $ServerOk 150 | Out-Null
+    }
     Wait-Until "TTS router"     { & $Checks["TTS router + VOICEVOX"] } 120 | Out-Null
 
     Show-Status
